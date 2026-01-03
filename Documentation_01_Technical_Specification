@@ -1,0 +1,432 @@
+# Technical Specification Document
+
+## 1. System Overview
+
+### 1.1 Purpose
+This Expert Advisor (EA) implements multiple advanced price action trading strategies for automated trading on MetaTrader 5 platform. 
+
+### 1.2 Scope
+- **Platform**: MetaTrader 5
+- **Language**: MQL5
+- **Markets**: Forex, Indices (particularly Volatility Indices)
+- **Trading Style**:  Swing/Day Trading
+- **Execution**: Automated with manual override capability
+
+## 2. Functional Requirements
+
+### 2.1 Market Structure Detection
+
+#### 2.1.1 Swing Point Identification
+**Algorithm**: Fractal-based swing detection
+
+**Input Parameters**:
+- `SwingLookback`: Number of bars to analyze (default: 20)
+- `MinSwingStrength`: Minimum candles on each side (default: 3)
+
+**Logic**:
+```
+For Swing High at bar i:
+  High[i] > High[i-1] AND High[i] > High[i-2] AND ... AND High[i] > High[i-MinSwingStrength]
+  AND
+  High[i] > High[i+1] AND High[i] > High[i+2] AND ...  AND High[i] > High[i+MinSwingStrength]
+
+For Swing Low at bar i: 
+  Low[i] < Low[i-1] AND Low[i] < Low[i-2] AND ... AND Low[i] < Low[i-MinSwingStrength]
+  AND
+  Low[i] < Low[i+1] AND Low[i] < Low[i+2] AND ... AND Low[i] < Low[i+MinSwingStrength]
+```
+
+**Output**:
+- Array of swing high prices and bar indices
+- Array of swing low prices and bar indices
+
+#### 2.1.2 Trend Classification
+
+**Uptrend Criteria**:
+```
+IF (Current_SwingHigh > Previous_SwingHigh) AND 
+   (Current_SwingLow > Previous_SwingLow) AND
+   (Count_of_HH_HL >= 2)
+THEN Trend = UPTREND
+```
+
+**Downtrend Criteria**:
+```
+IF (Current_SwingLow < Previous_SwingLow) AND 
+   (Current_SwingHigh < Previous_SwingHigh) AND
+   (Count_of_LL_LH >= 2)
+THEN Trend = DOWNTREND
+```
+
+**Ranging Criteria**:
+```
+IF (No clear HH/HL or LL/LH pattern) OR
+   (Price_Range < ATR * 1.5)
+THEN Trend = RANGING
+```
+
+### 2.2 Break of Structure (BOS) Detection
+
+#### 2.2.1 Bullish BOS
+**Conditions**:
+1. Previous trend = DOWNTREND
+2. Current candle closes ABOVE last Lower High (LH)
+3. Close price > LH price + (MinStructureDistance_Pips * Point)
+
+**Confirmation**:
+- If `RequireCandleConfirmation = true`: Wait for next candle close
+- Check volume increase (if `UseVolumeFilter = true`)
+
+**Code Logic**:
+```cpp
+bool DetectBullishBOS() {
+    if(currentTrend != TREND_DOWN) return false;
+    
+    double lastLH = GetLastLowerHigh();
+    double currentClose = iClose(_Symbol, EntryTimeframe, 0);
+    
+    if(currentClose > lastLH + MinStructureDistance_Pips * _Point) {
+        if(RequireCandleConfirmation) {
+            // Wait for bar to close
+            if(! IsNewBar()) return false;
+        }
+        return true;
+    }
+    return false;
+}
+```
+
+#### 2.2.2 Bearish BOS
+**Conditions**:
+1. Previous trend = UPTREND
+2. Current candle closes BELOW last Higher Low (HL)
+3. Close price < HL price - (MinStructureDistance_Pips * Point)
+
+### 2.3 Change of Character (CHOCH) Detection
+
+#### 2.3.1 Bullish CHOCH
+**Trigger Conditions**:
+```
+Previous_State = DOWNTREND
+AND
+Close[0] > LastSwingHigh (which is a Lower High in downtrend)
+AND
+Distance(Close[0], LastSwingHigh) >= MinStructureDistance_Pips
+```
+
+**Invalidation Point (INV-X) Calculation**:
+```cpp
+double CalculateINV_X_Bullish() {
+    // Find the last swing low before the CHOCH
+    double inv_x = GetSwingLowBeforeCHOCH();
+    
+    // Or find the demand zone (last down candle before impulse)
+    int impulseStartBar = FindImpulseStartBar();
+    double demandZone_High = iHigh(_Symbol, EntryTimeframe, impulseStartBar);
+    double demandZone_Low = iOpen(_Symbol, EntryTimeframe, impulseStartBar);
+    
+    return demandZone_Low; // Entry at bottom of zone
+}
+```
+
+### 2.4 Hidden Structure Detection
+
+#### 2.4.1 Identification Algorithm
+
+**Step 1**:  Detect HTF Break and Retest
+```cpp
+bool IsHTF_BreakAndRetest() {
+    // On Higher Timeframe (e.g., H4)
+    double resistanceLevel = FindPreviousResistance(HTF_Timeframe);
+    
+    // Check if broken
+    bool wasBroken = false;
+    for(int i = 0; i < 50; i++) {
+        if(iClose(_Symbol, HTF_Timeframe, i) > resistanceLevel) {
+            wasBroken = true;
+            break;
+        }
+    }
+    
+    if(! wasBroken) return false;
+    
+    // Check if currently retesting
+    double currentPrice = iClose(_Symbol, HTF_Timeframe, 0);
+    if(MathAbs(currentPrice - resistanceLevel) < RetestZone_TolerancePips * _Point) {
+        return true;
+    }
+    
+    return false;
+}
+```
+
+**Step 2**: Find Hidden Structure on LTF
+```cpp
+struct HiddenStructure {
+    double high;      // Wick high
+    double low;       // Body low
+    int barIndex;
+};
+
+HiddenStructure FindHiddenStructure() {
+    HiddenStructure hs;
+    
+    // Find the last bearish candle before the impulse that broke resistance
+    int impulseBar = FindHTF_BreakBar();
+    
+    // Switch to LTF
+    for(int i = impulseBar; i < impulseBar + 100; i++) {
+        double open = iOpen(_Symbol, EntryTimeframe, i);
+        double close = iClose(_Symbol, EntryTimeframe, i);
+        
+        // Look for strong bearish candle
+        if(close < open) {
+            double bodyPercent = MathAbs(close - open) / (iHigh(_Symbol, EntryTimeframe, i) - iLow(_Symbol, EntryTimeframe, i));
+            
+            if(bodyPercent >= HiddenStructure_MinBodyPercent / 100.0) {
+                hs. high = iHigh(_Symbol, EntryTimeframe, i);
+                hs.low = close; // Body low for bearish candle
+                hs.barIndex = i;
+                break;
+            }
+        }
+    }
+    
+    return hs;
+}
+```
+
+### 2.5 Entry Management
+
+#### 2.5.1 Entry Conditions Matrix
+
+| Strategy | Long Entry | Short Entry |
+|----------|-----------|-------------|
+| **APA** | BOS above LH + Retest LL | BOS below HL + Retest HH |
+| **CHOCH** | CHOCH above LH + Touch INV-X | CHOCH below HL + Touch INV-X |
+| **Hidden** | HTF support broken + Retest hidden demand | HTF resistance broken + Retest hidden supply |
+| **Top-Down** | Monthly uptrend + Weekly support retest | Monthly downtrend + Weekly resistance retest |
+
+#### 2.5.2 Entry Execution Logic
+
+```cpp
+bool ExecuteEntry(int direction) {
+    // Pre-execution checks
+    if(! IsSpreadAcceptable()) return false;
+    if(!IsEnoughMargin()) return false;
+    if(HasOpenTrade()) return false;
+    
+    // Calculate lot size
+    double lotSize = CalculateLotSize();
+    
+    // Calculate SL and TP
+    double sl = CalculateStopLoss(direction);
+    double tp = CalculateTakeProfit(direction, sl);
+    
+    // Prepare trade request
+    MqlTradeRequest request = {};
+    MqlTradeResult result = {};
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = lotSize;
+    request.type = (direction == DIRECTION_LONG) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    request.price = (direction == DIRECTION_LONG) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    request.sl = sl;
+    request.tp = tp;
+    request.deviation = 10;
+    request.magic = MagicNumber;
+    request.comment = TradeComment;
+    
+    // Send order
+    if(! OrderSend(request, result)) {
+        Print("OrderSend failed:  ", GetLastError());
+        return false;
+    }
+    
+    return true;
+}
+```
+
+### 2.6 Risk Management
+
+#### 2.6.1 Position Sizing
+
+**Fixed Risk Model**:
+```cpp
+double CalculateLotSize() {
+    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = accountBalance * (RiskPercent / 100.0);
+    
+    double slDistance_Points = MathAbs(entryPrice - stopLoss) / _Point;
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    
+    double lotSize = riskAmount / (slDistance_Points * tickValue / tickSize);
+    
+    // Apply lot constraints
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    
+    lotSize = MathMax(lotSize, minLot);
+    lotSize = MathMin(lotSize, maxLot);
+    lotSize = MathFloor(lotSize / lotStep) * lotStep;
+    
+    return lotSize;
+}
+```
+
+#### 2.6.2 Stop Loss Placement
+
+**APA Strategy**:
+- **Long**: SL = Invalidation Point (LL before BOS) - Buffer
+- **Short**: SL = Invalidation Point (HH before BOS) + Buffer
+
+```cpp
+double CalculateStopLoss_APA(int direction) {
+    double buffer = StopLoss_BufferPips * _Point;
+    
+    if(direction == DIRECTION_LONG) {
+        double invalidationPoint = GetLastLowBeforeBOS();
+        return invalidationPoint - buffer;
+    } else {
+        double invalidationPoint = GetLastHighBeforeBOS();
+        return invalidationPoint + buffer;
+    }
+}
+```
+
+**CHOCH Strategy**: 
+- **Long**: SL = Below INV-X zone
+- **Short**: SL = Above INV-X zone
+
+**Hidden Structure Strategy**:
+- **Long**:  SL = Below hidden demand zone low
+- **Short**: SL = Above hidden supply zone high
+
+#### 2.6.3 Take Profit Calculation
+
+**Risk-Reward Based**:
+```cpp
+double CalculateTakeProfit(int direction, double stopLoss) {
+    double entryPrice = (direction == DIRECTION_LONG) ? 
+        SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+        SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    double slDistance = MathAbs(entryPrice - stopLoss);
+    double tpDistance = slDistance * RiskRewardRatio;
+    
+    if(direction == DIRECTION_LONG) {
+        return entryPrice + tpDistance;
+    } else {
+        return entryPrice - tpDistance;
+    }
+}
+```
+
+**Structure-Based**:
+```cpp
+double CalculateTakeProfit_Structure(int direction) {
+    if(direction == DIRECTION_LONG) {
+        // Target next swing high
+        return GetNextSwingHigh(EntryTimeframe);
+    } else {
+        // Target next swing low
+        return GetNextSwingLow(EntryTimeframe);
+    }
+}
+```
+
+## 3. Non-Functional Requirements
+
+### 3.1 Performance
+- Maximum execution time per tick: < 100ms
+- Maximum memory usage: < 50MB
+- Support for 28 major currency pairs simultaneously
+
+### 3.2 Reliability
+- Error handling for all trading operations
+- Automatic reconnection on connection loss
+- Trade state persistence across EA restarts
+
+### 3.3 Usability
+- Clear visual feedback on charts
+- Comprehensive logging
+- User-friendly parameter descriptions
+
+### 3.4 Maintainability
+- Modular code structure
+- Comprehensive code comments
+- Version control integration
+
+## 4. Data Structures
+
+### 4.1 Swing Point Structure
+```cpp
+struct SwingPoint {
+    double price;
+    datetime time;
+    int barIndex;
+    ENUM_SWING_TYPE type; // HIGH or LOW
+    bool isValid;
+};
+```
+
+### 4.2 Market Structure State
+```cpp
+struct MarketStructure {
+    ENUM_TREND_TYPE trend;
+    SwingPoint lastHigh;
+    SwingPoint lastLow;
+    SwingPoint previousHigh;
+    SwingPoint previousLow;
+    bool bosDetected;
+    bool chochDetected;
+    datetime lastUpdate;
+};
+```
+
+### 4.3 Trade Setup Structure
+```cpp
+struct TradeSetup {
+    ENUM_STRATEGY_TYPE strategy;
+    int direction;
+    double entryPrice;
+    double stopLoss;
+    double takeProfit;
+    double invalidationLevel;
+    datetime setupTime;
+    bool isActive;
+};
+```
+
+## 5. External Interfaces
+
+### 5.1 MT5 Terminal Interface
+- Market data retrieval via `iHigh()`, `iLow()`, `iClose()`, `iOpen()`
+- Trade execution via `OrderSend()`
+- Position management via `PositionSelect()`, `PositionGetDouble()`
+
+### 5.2 User Interface
+- Chart annotations via `ObjectCreate()`
+- Input parameters via `input` variables
+- Logging via `Print()` and custom log files
+
+## 6. Assumptions and Dependencies
+
+### 6.1 Assumptions
+- Stable internet connection
+- Broker allows automated trading
+- Sufficient margin for trading
+- Market data is accurate and timely
+
+### 6.2 Dependencies
+- MT5 build 3280+
+- MQL5 Standard Library
+- No external DLLs required
+
+---
+
+**Document Version**: 1.0  
+**Date**: 2026-01-03
